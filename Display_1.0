@@ -1,0 +1,438 @@
+import pandas as pd
+import tkinter as tk
+from tkinter import font
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+import os
+import time
+from datetime import datetime
+from PIL import Image, ImageTk # Biblioteca para carregar imagens
+import random
+
+# --- CONFIGURAÇÕES GERAIS ---
+# Caminho para a planilha (não precisa mudar)
+NOME_ARQUIVO_EXCEL = "Planilha_Pontuacao_Atualizada.xlsx"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ARQUIVO_EXCEL = os.path.join(SCRIPT_DIR, NOME_ARQUIVO_EXCEL)
+
+# Caminho para a imagem da coroa
+ARQUIVO_COROA = os.path.join(SCRIPT_DIR, "ARQUIVO_COROA.png")
+
+# --- CUSTOMIZAÇÃO FÁCIL ---
+# Tempo em segundos que cada tela ficará visível APÓS o fim da animação.
+INTERVALO_DE_TRANSICAO_SEGUNDOS = 50
+
+# Velocidade da animação "slot machine" para NÚMEROS.
+VELOCIDADE_SLOT_MS = 40
+
+# Velocidade da animação de "digitação" para TEXTO.
+VELOCIDADE_DIGITACAO_MS = 50
+
+# --- VARIÁVEIS GLOBAIS DE CONTROLE ---
+df_global = pd.DataFrame() 
+tela_atual_index = 0
+atualizacao_pendente = True
+LIDER_ATUAL_NOME = None
+EMPATE_ATUAL_PONTOS = None
+ciclo_id = None
+df_snapshot_anterior = pd.DataFrame() # NOVO: Guarda os dados da última atualização para calcular o destaque
+destaque_do_dia_info = {"Vendedor": "Calculando...", "Pontos": 0} # NOVO: Guarda as informações do destaque
+
+# --- CLASSE PARA MONITORAR A PLANILHA ---
+class MonitorPlanilha(FileSystemEventHandler):
+    def on_modified(self, event):
+        global atualizacao_pendente
+        if event.src_path == ARQUIVO_EXCEL:
+            atualizacao_pendente = True
+            
+    def on_created(self, event):
+        global atualizacao_pendente
+        if event.src_path == ARQUIVO_EXCEL:
+            atualizacao_pendente = True
+
+# --- FUNÇÃO PARA CARREGAR E PROCESSAR OS DADOS ---
+def carregar_dados():
+    nomes_abas = [f'Plan{i}' for i in range(1, 6)]
+    lista_dfs = []
+    for nome_aba in nomes_abas:
+        try:
+            time.sleep(0.1) 
+            df_aba = pd.read_excel(ARQUIVO_EXCEL, sheet_name=nome_aba, skiprows=2, usecols="B:C", header=None, names=['Vendedor', 'Pontos'])
+            lista_dfs.append(df_aba)
+        except Exception:
+            pass
+    if not lista_dfs: return pd.DataFrame()
+    df_final = pd.concat(lista_dfs, ignore_index=True)
+    df_final["Pontos"] = pd.to_numeric(df_final["Pontos"], errors="coerce")
+    df_final = df_final.dropna(subset=["Vendedor", "Pontos"])
+    df_final = df_final.sort_values(by="Pontos", ascending=False, ignore_index=True)
+    return df_final
+
+# --- FUNÇÕES PARA CADA TELA ---
+
+def limpar_tela(frame):
+    for widget in frame.winfo_children():
+        widget.destroy()
+
+def mostrar_animacao_e_lider(frame, callback_fim_tela):
+    limpar_tela(frame)
+    canvas = tk.Canvas(frame, bg="#0f111a", highlightthickness=0)
+    canvas.pack(fill="both", expand=True)
+    if df_global.empty:
+        canvas.create_text(frame.winfo_screenwidth() / 2, frame.winfo_screenheight() / 2, text="Aguardando Pontuação", font=("Segoe UI", 50, "bold"), fill="white")
+        if callback_fim_tela: callback_fim_tela()
+        return
+    lider_nome = df_global.iloc[0]['Vendedor']
+    lider_pontos = int(df_global.iloc[0]['Pontos'])
+
+    def animar_texto_digitando(palavra, y_pos, fonte_config, cor, callback_final):
+        label = tk.Label(canvas, text="", font=fonte_config, bg="#0f111a", fg=cor)
+        canvas.create_window(frame.winfo_screenwidth() / 2, y_pos, window=label, anchor="center")
+        def revelar(index=0):
+            if index <= len(palavra):
+                label.config(text=palavra[:index]); root.after(VELOCIDADE_DIGITACAO_MS, lambda: revelar(index + 1))
+            elif callback_final: callback_final()
+        revelar()
+    
+    def animar_pontos_composto(pontos_str, y_pos, callback_final):
+        frame_pontos = tk.Frame(canvas, bg="#0f111a")
+        canvas.create_window(frame.winfo_screenwidth() / 2, y_pos, window=frame_pontos, anchor="center")
+        labels_numeros = [tk.Label(frame_pontos, text="", font=("Segoe UI", 70, "bold"), bg="#0f111a", fg="white") for _ in pontos_str]
+        for label in labels_numeros: label.pack(side="left")
+        def revelar_numero(index):
+            if index >= len(pontos_str):
+                animar_texto_no_frame(" PONTOS", frame_pontos, ("Segoe UI", 70), "white", callback_final)
+                return
+            def ciclo_letra(ciclo_atual):
+                if ciclo_atual < 10:
+                    labels_numeros[index].config(text=random.choice("0123456789")); root.after(VELOCIDADE_SLOT_MS, lambda: ciclo_letra(ciclo_atual + 1))
+                else:
+                    labels_numeros[index].config(text=pontos_str[index]); revelar_numero(index + 1)
+            ciclo_letra(0)
+        revelar_numero(0)
+
+    def animar_texto_no_frame(palavra, parent_frame, fonte_config, cor, callback):
+        label = tk.Label(parent_frame, text="", font=fonte_config, bg="#0f111a", fg=cor); label.pack(side="left")
+        def revelar(index=0):
+            if index <= len(palavra):
+                label.config(text=palavra[:index]); root.after(VELOCIDADE_DIGITACAO_MS, lambda: revelar(index + 1))
+            elif callback: callback()
+        revelar()
+
+    def iniciar_chuva_de_coroas():
+        try:
+            img_pil = Image.open(ARQUIVO_COROA).resize((40, 40), Image.Resampling.LANCZOS)
+            img_coroa = ImageTk.PhotoImage(img_pil)
+            canvas.img_ref = img_coroa 
+            coroas_na_tela = []
+            def criar_coroa():
+                x = random.randint(0, frame.winfo_screenwidth()); velocidade = random.randint(2, 6)
+                coroa_id = canvas.create_image(x, -40, image=img_coroa, anchor="center")
+                coroas_na_tela.append({'id': coroa_id, 'velocidade': velocidade})
+            def mover_coroas():
+                for coroa in list(coroas_na_tela):
+                    canvas.move(coroa['id'], 0, coroa['velocidade']); pos = canvas.coords(coroa['id'])
+                    if pos and pos[1] > frame.winfo_screenheight() + 40:
+                        canvas.delete(coroa['id']); coroas_na_tela.remove(coroa)
+                if random.random() < 0.25: criar_coroa()
+                if canvas.winfo_exists(): root.after(30, mover_coroas)
+            mover_coroas()
+        except FileNotFoundError: pass
+        if callback_fim_tela: callback_fim_tela()
+
+    fonte_lider = ("Segoe UI", 60, "bold") if len(lider_nome) > 20 else ("Segoe UI", 90, "bold")
+    animar_texto_digitando("PLACAR", 200, ("Segoe UI", 80, "bold"), "#00ff99", 
+        lambda: animar_texto_digitando(lider_nome, 450, fonte_lider, "white", 
+            lambda: animar_pontos_composto(str(lider_pontos), 650, iniciar_chuva_de_coroas)))
+
+def mostrar_empate(frame, callback_fim_tela):
+    limpar_tela(frame)
+    canvas = tk.Canvas(frame, bg="#0f111a", highlightthickness=0); canvas.pack(fill="both", expand=True)
+    pontos_lider = df_global.iloc[0]['Pontos']
+    empatados_df = df_global[df_global['Pontos'] == pontos_lider]
+    nomes_empatados = empatados_df['Vendedor'].tolist()
+    pontos_empate = int(pontos_lider)
+    
+    def animar_texto_digitando(palavra, y_pos, fonte_config, cor, callback_final):
+        label = tk.Label(canvas, text="", font=fonte_config, bg="#0f111a", fg=cor)
+        canvas.create_window(frame.winfo_screenwidth() / 2, y_pos, window=label, anchor="center")
+        def revelar(index=0):
+            if index <= len(palavra): label.config(text=palavra[:index]); root.after(VELOCIDADE_DIGITACAO_MS, lambda: revelar(index + 1))
+            elif callback_final: callback_final()
+        revelar()
+
+    def animar_pontos_composto(pontos_str, y_pos, callback_final):
+        frame_pontos = tk.Frame(canvas, bg="#0f111a"); canvas.create_window(frame.winfo_screenwidth() / 2, y_pos, window=frame_pontos, anchor="center")
+        labels_numeros = [tk.Label(frame_pontos, text="", font=("Segoe UI", 70, "bold"), bg="#0f111a", fg="white") for _ in pontos_str]
+        for label in labels_numeros: label.pack(side="left")
+        def revelar_numero(index):
+            if index >= len(pontos_str): animar_texto_no_frame(" PONTOS", frame_pontos, ("Segoe UI", 70), "white", callback_final); return
+            def ciclo_letra(ciclo_atual):
+                if ciclo_atual < 10: labels_numeros[index].config(text=random.choice("0123456789")); root.after(VELOCIDADE_SLOT_MS, lambda: ciclo_letra(ciclo_atual + 1))
+                else: labels_numeros[index].config(text=pontos_str[index]); revelar_numero(index + 1)
+            ciclo_letra(0)
+        revelar_numero(0)
+
+    def animar_texto_no_frame(palavra, parent_frame, fonte_config, cor, callback):
+        label = tk.Label(parent_frame, text="", font=fonte_config, bg="#0f111a", fg=cor); label.pack(side="left")
+        def revelar(index=0):
+            if index <= len(palavra): label.config(text=palavra[:index]); root.after(VELOCIDADE_DIGITACAO_MS, lambda: revelar(index + 1))
+            elif callback: callback()
+        revelar()
+
+    def final_da_animacao_empate():
+        if callback_fim_tela: callback_fim_tela()
+
+    nomes_texto = " & ".join(nomes_empatados); fonte_nomes = ("Segoe UI", 50, "bold") if len(nomes_texto) > 30 else ("Segoe UI", 70, "bold")
+    animar_texto_digitando("EMPATE NA LIDERANÇA!", 200, ("Segoe UI", 80, "bold"), "#00ff99", 
+        lambda: animar_texto_digitando(nomes_texto, 450, fonte_nomes, "white", 
+            lambda: animar_pontos_composto(str(pontos_empate), 650, final_da_animacao_empate)))
+
+def mostrar_ranking(frame, callback_fim_tela):
+    limpar_tela(frame)
+    tk.Label(frame, text="CLASSIFICAÇÃO GERAL - TOP 5", font=("Segoe UI", 40, "bold"), bg="#0f111a", fg="#00ff99").pack(pady=(40, 20))
+    if df_global.empty:
+        tk.Label(frame, text="Aguardando Pontuação", font=("Segoe UI", 30), bg="#0f111a", fg="white").pack(expand=True)
+    else:
+        ranking_texto = ""
+        for i, row in df_global.head(5).iterrows(): ranking_texto += f"{i+1}º   {row['Vendedor']:<30}   {int(row['Pontos'])} pts\n\n"
+        tk.Label(frame, text=ranking_texto, font=("Consolas", 35, "bold"), bg="#0f111a", fg="white", justify="left").pack(expand=True)
+    if callback_fim_tela: callback_fim_tela()
+
+def mostrar_grafico_desempenho(frame, callback_fim_tela):
+    """NOVA TELA: Exibe um gráfico de barras animado com o Top 5."""
+    limpar_tela(frame)
+    canvas = tk.Canvas(frame, bg="#0f111a", highlightthickness=0); canvas.pack(fill="both", expand=True)
+    canvas.create_text(frame.winfo_screenwidth()/2, 80, text="GRÁFICO DE DESEMPENHO", font=("Segoe UI", 40, "bold"), fill="#00ff99")
+
+    if df_global.empty or len(df_global) < 1:
+        canvas.create_text(frame.winfo_screenwidth()/2, frame.winfo_screenheight()/2, text="Aguardando Pontuação", font=("Segoe UI", 30), fill="white")
+        if callback_fim_tela: callback_fim_tela()
+        return
+
+    top_5 = df_global.head(5)
+    max_pontos = top_5['Pontos'].max()
+    if max_pontos == 0: max_pontos = 1 
+
+    largura_canvas = frame.winfo_screenwidth(); altura_canvas = frame.winfo_screenheight()
+    margem_x = 150; margem_y_superior = 150; margem_y_inferior = 100
+    largura_grafico = largura_canvas - 2 * margem_x; altura_grafico = altura_canvas - margem_y_superior - margem_y_inferior
+    espaco_barras = 50; largura_barra = (largura_grafico - (len(top_5) - 1) * espaco_barras) / len(top_5)
+    cores = ["#00ff99", "#00e58a", "#00cc7a", "#00b26b", "#00995c"]
+    
+    # --- Lógica da Animação ---
+    barras_info = []
+    for i, (_, row) in enumerate(top_5.iterrows()):
+        x0 = margem_x + i * (largura_barra + espaco_barras)
+        x1 = x0 + largura_barra
+        y1 = altura_canvas - margem_y_inferior
+        altura_final = (row['Pontos'] / max_pontos) * altura_grafico
+        
+        bar_id = canvas.create_rectangle(x0, y1, x1, y1, fill=cores[i % len(cores)], outline="") # Começa com altura zero
+        text_id = canvas.create_text(x0 + largura_barra/2, y1 - 25, text="", font=("Segoe UI", 22, "bold"), fill="white")
+        canvas.create_text(x0 + largura_barra/2, y1 + 30, text=row['Vendedor'], font=("Segoe UI", 18, "bold"), fill="white", width=largura_barra)
+        
+        barras_info.append({
+            'id': bar_id,
+            'text_id': text_id,
+            'pontos': int(row['Pontos']),
+            'y_final': y1 - altura_final, # Posição Y final no topo
+            'y_atual': y1,              # Posição Y inicial no topo
+            'velocidade': altura_final / 25 # 20 passos de animação
+        })
+
+    passos_animacao = 60 # Número de frames (quanto mais, mais suave)
+    delay_animacao_ms = 30 # Intervalo entre frames (velocidade)
+    passo_atual = 0
+
+    def animar_barras():
+        nonlocal passo_atual
+        if passo_atual < passos_animacao:
+            # Calcula a altura atual baseada no passo_atual
+            fator_crescimento = (passo_atual + 1) / passos_animacao
+            
+            for bar_data in barras_info:
+                # Nova posição y (o topo da barra)
+                y_novo = bar_data['y_final'] + (bar_data['y_atual'] - bar_data['y_final']) * (1 - fator_crescimento)
+                
+                # Atualiza as coordenadas do retângulo (barra)
+                coords = canvas.coords(bar_data['id'])
+                canvas.coords(bar_data['id'], coords[0], y_novo, coords[2], coords[3])
+                
+                # Atualiza a posição do texto (pontuação)
+                text_coords = canvas.coords(bar_data['text_id'])
+                canvas.coords(bar_data['text_id'], text_coords[0], y_novo - 25)
+
+            passo_atual += 1
+            if frame.winfo_exists():
+                root.after(delay_animacao_ms, animar_barras)
+        else:
+            # Fim da animação: Garante que as barras estejam na posição exata e mostra o texto
+            for bar_data in barras_info:
+                 # Move o topo da barra para a posição final exata
+                coords = canvas.coords(bar_data['id'])
+                canvas.coords(bar_data['id'], coords[0], bar_data['y_final'], coords[2], coords[3])
+                
+                # Move o texto para a posição final exata e define o texto
+                canvas.coords(bar_data['text_id'], coords[0] + largura_barra/2, bar_data['y_final'] - 25)
+                canvas.itemconfigure(bar_data['text_id'], text=f"{bar_data['pontos']}")
+
+            # Chama a função de callback para avançar para a próxima tela
+            if callback_fim_tela:
+                callback_fim_tela()
+
+    # Inicia a animação
+    animar_barras()
+
+def mostrar_destaque_dia(frame, callback_fim_tela):
+    """NOVA TELA: Mostra o vendedor que mais pontuou desde a última atualização."""
+    limpar_tela(frame)
+    canvas = tk.Canvas(frame, bg="#0f111a", highlightthickness=0); canvas.pack(fill="both", expand=True)
+    canvas.create_text(frame.winfo_screenwidth()/2, 200, text="🌟 DESTAQUE DO DIA 🌟", font=("Segoe UI", 80, "bold"), fill="yellow")
+
+    if destaque_do_dia_info['Pontos'] > 0:
+        canvas.create_text(frame.winfo_screenwidth()/2, 450, text=destaque_do_dia_info['Vendedor'], font=("Segoe UI", 90, "bold"), fill="white")
+        canvas.create_text(frame.winfo_screenwidth()/2, 650, text=f"+ {int(destaque_do_dia_info['Pontos'])} PONTOS HOJE", font=("Segoe UI", 70, "bold"), fill="#00ff99")
+    else:
+        canvas.create_text(frame.winfo_screenwidth()/2, 550, text=destaque_do_dia_info['Vendedor'], font=("Segoe UI", 50, "bold"), fill="white")
+    
+    if callback_fim_tela: callback_fim_tela()
+
+def mostrar_relogio(frame, callback_fim_tela):
+    limpar_tela(frame)
+    hora_atual = datetime.now().hour
+    saudacao = "Boa noite!"
+    if 5 <= hora_atual < 12: saudacao = "Bom dia!"
+    elif 12 <= hora_atual < 18: saudacao = "Boa tarde!"
+    tk.Label(frame, text=saudacao, font=("Segoe UI", 80, "bold"), bg="#0f111a", fg="#00ff99").pack(pady=(50, 10), expand=True)
+    label_relogio = tk.Label(frame, font=("Segoe UI", 150, "bold"), bg="#0f111a", fg="white"); label_relogio.pack(pady=10, expand=True)
+    def atualizar_relogio_tela():
+        label_relogio.config(text=datetime.now().strftime("%H:%M:%S"))
+        if frame.winfo_exists(): frame.after(1000, atualizar_relogio_tela)
+    atualizar_relogio_tela()
+    if callback_fim_tela: callback_fim_tela()
+
+def anunciar_novo_lider(nome_lider):
+    global ciclo_id
+    if ciclo_id: root.after_cancel(ciclo_id); ciclo_id = None
+    popup = tk.Toplevel(root); popup.overrideredirect(True); popup.configure(bg="#0f111a", highlightthickness=3, highlightbackground="#00ff99")
+    largura_popup, altura_popup = 950, 450; x_root = root.winfo_x() + (root.winfo_width() // 2) - (largura_popup // 2); y_root = root.winfo_y() + (root.winfo_height() // 2) - (altura_popup // 2)
+    popup.geometry(f"{largura_popup}x{altura_popup}+{x_root}+{y_root}"); popup.attributes('-topmost', True)
+    frame_popup = tk.Frame(popup, bg="#0f111a"); frame_popup.pack(expand=True, fill='both', padx=20, pady=20)
+    tk.Label(frame_popup, text="🚨 MUDANÇA NA LIDERANÇA! 🚨", font=("Segoe UI", 40, "bold"), bg="#0f111a", fg="yellow", wraplength=largura_popup-40).pack(pady=10)
+    tk.Label(frame_popup, text="Temos um novo líder!", font=("Segoe UI", 35, "bold"), bg="#0f111a", fg="#00ff99").pack(pady=10)
+    fonte_nome = ("Segoe UI", 60, "bold")
+    if len(nome_lider) > 25: fonte_nome = ("Segoe UI", 35, "bold")
+    elif len(nome_lider) > 18: fonte_nome = ("Segoe UI", 45, "bold")
+    tk.Label(frame_popup, text=nome_lider, font=fonte_nome, bg="#0f111a", fg="white").pack(pady=20)
+    def fechar_e_reiniciar():
+        popup.destroy(); global tela_atual_index; tela_atual_index = 0; ciclo_de_telas(container)
+    popup.after(8000, fechar_e_reiniciar)
+
+def anunciar_empate(nomes_empatados):
+    global ciclo_id
+    if ciclo_id: root.after_cancel(ciclo_id); ciclo_id = None
+    popup = tk.Toplevel(root); popup.overrideredirect(True); popup.geometry(f"{root.winfo_screenwidth()}x{root.winfo_screenheight()}+0+0")
+    popup.configure(bg="#0f111a"); popup.attributes('-topmost', True)
+    frame_empate = tk.Frame(popup, bg="#0f111a"); frame_empate.pack(expand=True)
+    label_aviso = tk.Label(frame_empate, text="Temos um empate!", font=("Segoe UI", 100, "bold"), fg="white", bg="#0f111a"); label_aviso.pack(pady=50)
+    def fechar_e_reiniciar_empate():
+        popup.destroy(); global tela_atual_index; tela_atual_index = 0; ciclo_de_telas(container)
+    def mostrar_nomes_final():
+        limpar_tela(frame_empate)
+        tk.Label(frame_empate, text="EMPATE NA LIDERANÇA!", font=("Segoe UI", 40, "bold"), bg="#0f111a", fg="#00ff99").pack(pady=20)
+        nomes_texto = "\n".join(nomes_empatados)
+        tk.Label(frame_empate, text=nomes_texto, font=("Segoe UI", 50, "bold"), bg="#0f111a", fg="white", justify="center").pack()
+        popup.after(8000, fechar_e_reiniciar_empate)
+    def piscar(vezes):
+        if vezes <= 0: mostrar_nomes_final(); return
+        nova_cor = "red" if frame_empate.cget("bg") == "#0f111a" else "#0f111a"
+        for widget in [popup, frame_empate]: widget.config(bg=nova_cor)
+        popup.after(500, lambda: piscar(vezes - 1))
+    piscar(6)
+
+# --- FUNÇÃO PRINCIPAL DE CONTROLE DAS TELAS ---
+def tela_principal(frame, callback_fim_tela):
+    if not df_global.empty:
+        pontos_lider = df_global.iloc[0]['Pontos']
+        if len(df_global[df_global['Pontos'] == pontos_lider]) > 1:
+            mostrar_empate(frame, callback_fim_tela); return
+    mostrar_animacao_e_lider(frame, callback_fim_tela)
+
+telas = [tela_principal, mostrar_ranking, mostrar_grafico_desempenho, mostrar_destaque_dia, mostrar_relogio]
+
+def ciclo_de_telas(frame):
+    global tela_atual_index, ciclo_id
+    def agendar_proxima_tela():
+        global ciclo_id, tela_atual_index
+        tela_atual_index = (tela_atual_index + 1) % len(telas)
+        ciclo_id = root.after(INTERVALO_DE_TRANSICAO_SEGUNDOS * 1000, lambda: ciclo_de_telas(frame))
+    telas[tela_atual_index](frame, agendar_proxima_tela)
+
+def verificar_atualizacoes(frame):
+    global df_global, atualizacao_pendente, LIDER_ATUAL_NOME, EMPATE_ATUAL_PONTOS, df_snapshot_anterior, destaque_do_dia_info
+    if atualizacao_pendente:
+        df_global = carregar_dados(); atualizacao_pendente = False; anuncio_feito = False
+
+        # NOVO: Lógica para calcular o Destaque do Dia
+        if not df_snapshot_anterior.empty and not df_global.empty:
+            df_merged = pd.merge(df_global, df_snapshot_anterior, on='Vendedor', suffixes=('_novo', '_antigo'), how='left')
+            df_merged['Pontos_antigo'] = df_merged['Pontos_antigo'].fillna(0)
+            df_merged['Diferenca'] = df_merged['Pontos_novo'] - df_merged['Pontos_antigo']
+            maior_diferenca = df_merged.loc[df_merged['Diferenca'].idxmax()]
+            if maior_diferenca['Diferenca'] > 0:
+                destaque_do_dia_info = {"Vendedor": maior_diferenca['Vendedor'], "Pontos": maior_diferenca['Diferenca']}
+        df_snapshot_anterior = df_global.copy()
+
+        if df_global.empty: LIDER_ATUAL_NOME, EMPATE_ATUAL_PONTOS = None, None
+        else:
+            pontos_lider = df_global.iloc[0]['Pontos']; empatados_df = df_global[df_global['Pontos'] == pontos_lider]
+            if len(empatados_df) > 1:
+                if EMPATE_ATUAL_PONTOS != pontos_lider: anunciar_empate(empatados_df['Vendedor'].tolist()); anuncio_feito = True
+                EMPATE_ATUAL_PONTOS, LIDER_ATUAL_NOME = pontos_lider, None 
+            else:
+                novo_lider_nome = df_global.iloc[0]['Vendedor']
+                if (LIDER_ATUAL_NOME is not None and novo_lider_nome != LIDER_ATUAL_NOME) or (EMPATE_ATUAL_PONTOS is not None):
+                    anunciar_novo_lider(novo_lider_nome); anuncio_feito = True
+                LIDER_ATUAL_NOME, EMPATE_ATUAL_PONTOS = novo_lider_nome, None
+        
+        if not anuncio_feito:
+            global ciclo_id, tela_atual_index
+            if ciclo_id: root.after_cancel(ciclo_id)
+            tela_atual_index = (tela_atual_index - 1 + len(telas)) % len(telas); ciclo_de_telas(frame)
+    root.after(2000, lambda: verificar_atualizacoes(frame))
+
+# --- INICIALIZAÇÃO DA INTERFACE GRÁFICA ---
+
+# FUNÇÃO PARA MINIMIZAR/ICONIFICAR
+def minimizar_janela(event=None):
+    """Minimiza/Iconifica a janela principal."""
+    # Primeiro desliga o fullscreen e depois minimiza para garantir que funcione corretamente
+    root.attributes('-fullscreen', False)
+    root.iconify() 
+    # Reativa o fullscreen quando a janela for restaurada (evento <Map>)
+    root.bind('<Map>', restaurar_fullscreen)
+
+def restaurar_fullscreen(event=None):
+    """Reativa o fullscreen quando a janela é restaurada (desminimizar)."""
+    # Remove o binding temporário para evitar recursão ou chamadas desnecessárias
+    root.unbind('<Map>', restaurar_fullscreen)
+    # Reativa o fullscreen após um pequeno atraso para o Tkinter processar o restauro
+    root.after(100, lambda: root.attributes('-fullscreen', True))
+
+
+root = tk.Tk(); root.title("Painel de Pontuação - RODOLUB"); root.configure(bg="#0f111a")
+root.attributes('-fullscreen', True); root.attributes('-topmost', True)
+
+# ASSOCIA A TECLA Alt + t (Mod1 + t) à função de minimizar
+# O '<Alt-t>' ou '<Mod1-t>' funciona como Alt+t na maioria dos sistemas
+root.bind('<Alt-t>', minimizar_janela)
+root.bind('<Mod1-t>', minimizar_janela) # Alternativa para Alt
+
+container = tk.Frame(root, bg="#0f111a"); container.pack(fill="both", expand=True)
+
+# --- INICIALIZAÇÃO DO MONITORAMENTO E DO PAINEL ---
+observer = Observer(); observer.schedule(MonitorPlanilha(), path=SCRIPT_DIR, recursive=False); observer.start()
+verificar_atualizacoes(container); ciclo_de_telas(container)
+try: root.mainloop()
+finally: observer.stop(); observer.join()
