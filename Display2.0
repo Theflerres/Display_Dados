@@ -1,0 +1,1060 @@
+import pandas as pd
+import tkinter as tk
+from tkinter import font, messagebox
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+import os
+import time
+from datetime import datetime
+from PIL import Image, ImageTk, ImageGrab # ImageGrab para screenshots
+import random
+import sqlite3
+import re
+import schedule # Para agendamento
+import threading # Para rodar o envio de email em paralelo
+import win32com.client as win32 # Para controlar o Outlook
+import pythoncom
+
+# =============================================================================
+# 1. CONFIGURAÇÃO CENTRALIZADA
+# =============================================================================
+CONFIG = {
+    "file_paths": {
+        "excel": "Planilha_Pontuacao_Atualizada.xlsx",
+        "clients": "Tabela_Cliente.xlsx",
+        "icons_folder": "icons",
+        "screenshots_folder": "screenshots_temp" # Pasta temporária para fotos
+    },
+    "window": {
+        "title": "Dashboard de Performance - RODOLUB v2.0 (Email Auto)",
+        "geometry": "1366x768"
+    },
+    "email_settings": {
+        "send_time": "15:00", # Horário de envio (formato HH:MM)
+        "boss_email": "nathalia@rodolub.com.br", # <--- COLOQUE O EMAIL DA CHEFE AQUI
+        "coordinator_emails": {
+            # --- IMPORTANTE: Coloque aqui o nome EXATO do coordenador (como está na A3) e seu email ---
+            "EDDIE ALVES LOBATO": "email_coord@exemplo.com",
+            "LUIZ HENRIQUE SEGGUES RODRIGUES": "email_coord@exemplo.com",
+            "MAURICIO DA CONCEIÇÃO CARNEIRO": "email_coord@exemplo.com",
+            "MAURICIO GUEDES STREIT": "email_coord@exemplo.com",
+            "PATRICK SOARES FERREIRA PITHON FERNANDES": "email_coord@exemplo.com",
+            #"Coordenador 3": "email_coord3@exemplo.com", # Exemplo
+            # Adicione todos os coordenadores
+        },
+        "subject": "Atualização Campanha Execução Premiada",
+        "body_header": "Boa tarde!\n\nSegue(m) atualizada(s) a(s) foto(s) da campanha Execução Premiada.",
+        "body_footer": "\n\nAviso: Os dados são atualizados de Segunda a Sexta, das 09:00 às 15:00. Pontuações enviadas após este horário serão processadas no próximo dia útil."
+    },
+    "scoring_actions": {
+        "Planograma": 3, "Precificador": 2, "MPDV": 1,
+        "Ponto extra com produto foco": 5, "Troca Inteligente": 2, "Ativação": 1
+    },
+    "colors": {
+        "background": "#1c1c24", "sidebar_bg": "#252836", "content_bg": "#1f1d2b",
+        "primary": "#00ff99", "secondary": "#ffc700", "text_light": "#ffffff",
+        "text_dark": "#8e8e93", "button_hover": "#3a3d4a",
+        "chart_colors": ["#00ff99", "#ffc700", "#00c2ff", "#ff5733", "#c700ff"]
+    },
+    "fonts": {
+        "title": ("Segoe UI", 32, "bold"), "subtitle": ("Segoe UI", 24, "bold"),
+        "normal_bold": ("Segoe UI", 16, "bold"), "normal": ("Segoe UI", 16),
+        "monospace": ("Consolas", 18, "bold"), "display": ("Segoe UI Black", 90, "bold")
+    },
+    "animation": { "reveal_speed_ms": 20, "ranking_slide_delay_ms": 100, "chart_draw_speed_ms": 5 },
+    "update_interval_ms": 2000,
+    "slideshow_interval_seconds": 20,
+    "coordinator_slideshow_seconds": 8
+}
+
+# =============================================================================
+# 2. CLASSE DE GERENCIAMENTO DE DADOS (COM DADOS DE COORDENADOR)
+# =============================================================================
+
+class DataHandler:
+    # ... (A classe DataHandler inteira da versão anterior permanece aqui) ...
+    # (Incluindo __init__, _setup_database, _save_event_to_db, add_score_event_to_history,
+    # _load_client_data, get_client_info, add_score, _save_scores_to_db, load_and_process_data,
+    # _calculate_all_metrics, _calculate_achievements, get_data, get_line_chart_data)
+
+    def __init__(self, file_path_scores, file_path_clients):
+        self.file_path_scores = file_path_scores
+        self.file_path_clients = file_path_clients
+        self.db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard_history.db")
+        self.df, self.df_previous, self.df_clients = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        self.data, self.history = {}, []
+        self.update_flag = True
+        self._setup_database()
+        self._load_client_data()
+
+    def _setup_database(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('CREATE TABLE IF NOT EXISTS leadership_history (id INTEGER PRIMARY KEY, timestamp TEXT, event_type TEXT, event_text TEXT, points REAL, details TEXT)')
+        cursor.execute('CREATE TABLE IF NOT EXISTS score_history (id INTEGER PRIMARY KEY, timestamp TEXT, vendedor TEXT, pontos REAL)')
+        conn.commit()
+        cursor.execute("PRAGMA table_info(leadership_history)")
+        columns = [info[1] for info in cursor.fetchall()]
+        if 'details' not in columns: cursor.execute("ALTER TABLE leadership_history ADD COLUMN details TEXT"); conn.commit()
+        cursor.execute("SELECT timestamp, event_type, event_text, points, details FROM leadership_history ORDER BY timestamp DESC")
+        for row in cursor.fetchall(): self.history.append({"timestamp": datetime.fromisoformat(row[0]), "type": row[1], "text": row[2], "points": row[3], "details": row[4]})
+        conn.close()
+
+    def _save_event_to_db(self, event):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('INSERT INTO leadership_history (timestamp, event_type, event_text, points, details) VALUES (?, ?, ?, ?, ?)',
+                       (event['timestamp'].isoformat(), event['type'], event['text'], event['points'], event.get('details', '')))
+        conn.commit()
+        conn.close()
+
+    def add_score_event_to_history(self, text, points, details_text=""):
+        event = {"timestamp": datetime.now(), "points": points, "type": "score_update", "text": text, "details": details_text}
+        self.history.insert(0, event)
+        self._save_event_to_db(event)
+
+    def _load_client_data(self):
+        try:
+            self.df_clients = pd.read_excel(self.file_path_clients, header=0)
+            normalized_columns = [re.sub(r'\s+', ' ', col).strip() for col in self.df_clients.columns]
+            self.df_clients.columns = normalized_columns
+            self.df_clients.rename(columns={"Rótulos de Linha": "ID_Cliente", "Nome da conta": "Nome_Cliente", "Vendedor": "Vendedor"}, inplace=True)
+            if "ID_Cliente" not in self.df_clients.columns or "Nome_Cliente" not in self.df_clients.columns:
+                print("ERRO CRÍTICO: Colunas 'Rótulos de Linha' ou 'Nome da conta' não encontradas."); self.df_clients = pd.DataFrame(); return
+            self.df_clients['ID_Cliente'] = self.df_clients['ID_Cliente'].astype(str).str.strip()
+            self.df_clients.dropna(subset=['ID_Cliente'], inplace=True)
+            print(f"Tabela de clientes carregada com {len(self.df_clients)} registros.")
+        except Exception as e:
+            print(f"ERRO CRÍTICO ao carregar Tabela_Cliente.xlsx: {e}"); self.df_clients = pd.DataFrame()
+
+    def get_client_info(self, client_id):
+        if self.df_clients.empty: return None, None
+        try:
+            search_id = str(client_id).strip()
+            client_row = self.df_clients[self.df_clients["ID_Cliente"] == search_id]
+            if not client_row.empty: return client_row.iloc[0]["Nome_Cliente"], client_row.iloc[0]["Vendedor"]
+        except Exception as e:
+            print(f"Erro ao procurar ID do cliente: {e}")
+        return None, None
+
+    def add_score(self, vendedor, pontos):
+        try:
+            from openpyxl import load_workbook
+            workbook = load_workbook(self.file_path_scores)
+            vendedor_encontrado = False
+            for i in range(1, 6):
+                sheet_name = f"Plan{i}"
+                if sheet_name in workbook.sheetnames:
+                    sheet = workbook[sheet_name]
+                    for row in range(3, 9): # Assumindo 6 vendedores por planilha (B3 a B8)
+                        nome_vendedor_planilha = sheet[f'B{row}'].value
+                        if nome_vendedor_planilha and vendedor.strip().lower() == str(nome_vendedor_planilha).strip().lower():
+                            pontuacao_atual = sheet[f'C{row}'].value or 0
+                            nova_pontuacao = float(pontuacao_atual) + float(pontos)
+                            sheet[f'C{row}'].value = nova_pontuacao
+                            vendedor_encontrado = True
+                            print(f"Vendedor '{vendedor}' encontrado na Plan{i}. Pontuação atualizada de {pontuacao_atual} para {nova_pontuacao}.")
+                            break
+                if vendedor_encontrado: break
+            if vendedor_encontrado:
+                workbook.save(self.file_path_scores); return True
+            else:
+                print(f"ERRO: Vendedor '{vendedor}' não foi encontrado."); return False
+        except PermissionError:
+             print(f"ERRO DE PERMISSÃO: Não foi possível salvar '{self.file_path_scores}'. O arquivo está aberto em outro programa (Excel)?")
+             return False
+        except Exception as e:
+            print(f"ERRO ao escrever na planilha: {e}"); return False
+
+    def _save_scores_to_db(self, df_scores):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        timestamp = datetime.now().isoformat()
+        for _, row in df_scores.iterrows():
+            cursor.execute('INSERT INTO score_history (timestamp, vendedor, pontos) VALUES (?, ?, ?)', (timestamp, row['Vendedor'], row['Pontos']))
+        conn.commit()
+        conn.close()
+
+    def load_and_process_data(self):
+        if not self.update_flag: return False
+        try:
+            from openpyxl import load_workbook
+            time.sleep(0.2)
+            all_dfs = []
+            workbook = load_workbook(self.file_path_scores, data_only=True)
+
+            for i in range(1, 6):
+                sheet_name = f"Plan{i}"
+                if sheet_name in workbook.sheetnames:
+                    sheet = workbook[sheet_name]
+                    coordinator_name = sheet['A3'].value or f"Coordenador {i}"
+                    try:
+                        df_sheet = pd.read_excel(self.file_path_scores, sheet_name=sheet_name, skiprows=2, usecols="B:C", header=None, names=['Vendedor', 'Pontos'])
+                        df_sheet['Coordenador'] = coordinator_name
+                        all_dfs.append(df_sheet)
+                    except Exception as e: continue
+
+            if not all_dfs: self.update_flag = False; return False
+            new_df = pd.concat(all_dfs, ignore_index=True)
+            new_df["Pontos"] = pd.to_numeric(new_df["Pontos"], errors="coerce")
+            new_df = new_df.dropna(subset=["Vendedor", "Pontos"])
+            new_df = new_df.sort_values(by="Pontos", ascending=False, ignore_index=True)
+
+            # Compara apenas as colunas relevantes para salvar no histórico de score
+            cols_to_compare = ['Vendedor', 'Pontos']
+            df_for_compare = self.df[cols_to_compare] if not self.df.empty and all(c in self.df.columns for c in cols_to_compare) else pd.DataFrame(columns=cols_to_compare)
+            if not new_df[cols_to_compare].equals(df_for_compare):
+                 self._save_scores_to_db(new_df)
+
+            self.df_previous = self.df.copy()
+            self.df = new_df
+            self._calculate_all_metrics()
+            self.update_flag = False
+            return True
+        except Exception as e:
+            print(f"Erro ao carregar dados de pontuação: {e}"); self.update_flag = False; return False
+
+    def _calculate_all_metrics(self):
+        if self.df.empty:
+            self.data = {"leader": None, "tie": None, "top_5": [], "achievements": [], "history": self.history, "coordinator_rankings": {}}; return
+
+        coordinator_rankings = {}
+        if 'Coordenador' in self.df.columns:
+            for name, group in self.df.groupby('Coordenador'):
+                sorted_group = group.sort_values(by='Pontos', ascending=False)
+                coordinator_rankings[name] = sorted_group.to_dict('records')
+
+        old_leader_name = self.df_previous.iloc[0]['Vendedor'] if not self.df_previous.empty and 'Vendedor' in self.df_previous.columns else None
+        new_leader_name = self.df.iloc[0]['Vendedor'] if not self.df.empty else None
+
+        if old_leader_name and new_leader_name and old_leader_name != new_leader_name:
+            event = {"timestamp": datetime.now(), "points": self.df.iloc[0]['Pontos'], "type": "takeover", "text": f"{new_leader_name} tomou a liderança de {old_leader_name}!"}
+            self.history.insert(0, event); self._save_event_to_db(event)
+
+        leader_score = self.df.iloc[0]['Pontos'] if not self.df.empty else 0
+        tied_leaders = self.df[self.df['Pontos'] == leader_score] if not self.df.empty else pd.DataFrame()
+
+        self.data.update({
+            'leader': self.df.iloc[0].to_dict() if len(tied_leaders) == 1 else None,
+            'tie': tied_leaders.to_dict('records') if len(tied_leaders) > 1 else None,
+            'top_5': self.df.head(5).to_dict('records') if not self.df.empty else [],
+            'history': self.history,
+            'coordinator_rankings': coordinator_rankings
+        })
+        self._calculate_achievements()
+
+    def _calculate_achievements(self):
+        achievements = []
+        if self.df.empty: self.data['achievements'] = []; return
+        if self.data['leader']: achievements.append({"icon": "🏆", "title": "Na Liderança", "vendedor": self.data['leader']['Vendedor'], "desc": "No topo do placar!"})
+        if not self.df_previous.empty and 'Vendedor' in self.df_previous.columns and 'Pontos' in self.df_previous.columns:
+             try: # Adiciona try-except para mais robustez
+                merged = pd.merge(self.df, self.df_previous, on='Vendedor', suffixes=('_new', '_old'), how='left').fillna(0)
+                if 'Pontos_new' in merged.columns and 'Pontos_old' in merged.columns:
+                    merged['gain'] = merged['Pontos_new'] - merged['Pontos_old']
+                    if not merged.empty and merged['gain'].max() > 0:
+                        hottest = merged.loc[merged['gain'].idxmax()]
+                        achievements.append({"icon": "🔥", "title": "Em Chamas", "vendedor": hottest['Vendedor'], "desc": f"Ganhou +{int(hottest['gain'])} pontos."})
+
+                df_new_ranked = self.df.reset_index().rename(columns={'index': 'rank_new'})
+                df_old_ranked = self.df_previous.reset_index().rename(columns={'index': 'rank_old'})
+                merged_rank = pd.merge(df_new_ranked, df_old_ranked, on='Vendedor', how='left').fillna(len(df_old_ranked))
+                if not merged_rank.empty and 'rank_old' in merged_rank.columns and 'rank_new' in merged_rank.columns:
+                    merged_rank['rank_climb'] = merged_rank['rank_old'] - merged_rank['rank_new']
+                    if 'rank_climb' in merged_rank.columns and merged_rank['rank_climb'].max() > 0:
+                        climber = merged_rank.loc[merged_rank['rank_climb'].idxmax()]
+                        achievements.append({"icon": "🚀", "title": "Velocista", "vendedor": climber['Vendedor'], "desc": f"Subiu {int(climber['rank_climb'])} posições."})
+             except Exception as e:
+                 print(f"Erro ao calcular conquistas: {e}") # Ajuda a depurar
+        self.data['achievements'] = achievements
+
+
+    def get_data(self): return self.data
+    def get_line_chart_data(self):
+        if self.df.empty: return {}
+        top_5_vendedores = self.df.head(5)['Vendedor'].tolist()
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        chart_data = {}
+        for vendedor in top_5_vendedores:
+            cursor.execute("SELECT timestamp, pontos FROM score_history WHERE vendedor = ? ORDER BY timestamp ASC", (vendedor,))
+            chart_data[vendedor] = [(datetime.fromisoformat(row[0]), row[1]) for row in cursor.fetchall()]
+        conn.close()
+        return chart_data
+        
+# =============================================================================
+# 3. CLASSES DE TELA (Com Coordenadores)
+# =============================================================================
+class BaseScreen(tk.Frame):
+    # ... (código inalterado) ...
+    def __init__(self, parent, data_handler, **kwargs):
+        super().__init__(parent, bg=CONFIG["colors"]["content_bg"], **kwargs)
+        self.data_handler = data_handler
+        self.animation_job = None
+        self.build_ui()
+    def build_ui(self):
+        self.title_label = tk.Label(self, text="Título", font=CONFIG["fonts"]["title"], bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["primary"])
+        self.title_label.pack(pady=(20, 10))
+    def show(self, single_coord=None): # Modificado para aceitar argumento
+        self.pack(fill="both", expand=True)
+        if self.animation_job: self.after_cancel(self.animation_job)
+        self.update_content(single_coord=single_coord) # Passa o argumento
+    def hide(self):
+        if self.animation_job: self.after_cancel(self.animation_job)
+        self.pack_forget()
+    def update_content(self, single_coord=None): pass # Modificado para aceitar argumento
+
+class LeaderScreen(BaseScreen):
+    # ... (código inalterado) ...
+    def build_ui(self):
+        self.config(bg=CONFIG["colors"]["content_bg"])
+        center_frame = tk.Frame(self, bg=CONFIG["colors"]["content_bg"])
+        center_frame.pack(expand=True)
+        self.title_label = tk.Label(center_frame, font=CONFIG["fonts"]["title"], bg=CONFIG["colors"]["content_bg"])
+        self.title_label.pack(pady=(10, 20), padx=20)
+        self.name_label = tk.Label(center_frame, font=CONFIG["fonts"]["display"], bg=CONFIG["colors"]["content_bg"])
+        self.name_label.pack(pady=20, padx=50)
+        self.points_label = tk.Label(center_frame, font=CONFIG["fonts"]["subtitle"], bg=CONFIG["colors"]["content_bg"])
+        self.points_label.pack(pady=20, padx=20)
+        self.bind("<Configure>", self._on_resize)
+    def _on_resize(self, event=None):
+        wraplength = self.winfo_width() - 100
+        if wraplength > 0: self.name_label.config(wraplength=wraplength); self.title_label.config(wraplength=wraplength)
+    def _animate_reveal(self, label, final_color):
+        label.config(fg="#333")
+        self.after(100, lambda: label.config(fg="#666"))
+        self.after(200, lambda: label.config(fg="#999"))
+        self.after(300, lambda: label.config(fg="#ccc"))
+        self.after(400, lambda: label.config(fg=final_color))
+    def update_content(self, single_coord=None):
+        data = self.data_handler.get_data()
+        if data.get('leader'):
+            leader, name = data['leader'], data['leader']['Vendedor']
+            font_size = 90
+            if len(name) > 40: font_size = 40
+            elif len(name) > 30: font_size = 50
+            elif len(name) > 20: font_size = 65
+            self.title_label.config(text="LÍDER ATUAL", fg=CONFIG["colors"]["primary"])
+            self.name_label.config(text=name, font=("Segoe UI Black", font_size, "bold"))
+            self.points_label.config(text=f"{int(leader['Pontos'])} PONTOS")
+            self._animate_reveal(self.name_label, CONFIG["colors"]["text_light"])
+            self._animate_reveal(self.points_label, CONFIG["colors"]["secondary"])
+        elif data.get('tie'):
+            names = " & ".join([p['Vendedor'] for p in data['tie']])
+            points = int(data['tie'][0]['Pontos'])
+            font_size = 24
+            if len(names) > 80: font_size = 16
+            elif len(names) > 50: font_size = 20
+            self.title_label.config(text="EMPATE NA LIDERANÇA!", fg=CONFIG["colors"]["secondary"])
+            self.name_label.config(text=names, font=("Segoe UI", font_size, "bold"))
+            self.points_label.config(text=f"{points} PONTOS")
+            self._animate_reveal(self.name_label, CONFIG["colors"]["text_light"])
+            self._animate_reveal(self.points_label, CONFIG["colors"]["primary"])
+        else:
+            self.title_label.config(text="")
+            self.name_label.config(text="Aguardando Dados...", font=CONFIG["fonts"]["title"], fg=CONFIG["colors"]["text_dark"])
+            self.points_label.config(text="")
+        self.after(10, self._on_resize)
+    def show(self, single_coord=None): super().show(); self.after(50, self._on_resize)
+
+class RankingScreen(BaseScreen):
+    # ... (código inalterado) ...
+    def build_ui(self):
+        self.title_label = tk.Label(self, text="TOP 5 - CLASSIFICAÇÃO", font=CONFIG["fonts"]["title"], bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["primary"])
+        self.title_label.pack(pady=(20, 30))
+        self.ranking_frame = tk.Frame(self, bg=CONFIG["colors"]["content_bg"])
+        self.ranking_frame.pack(expand=True, fill="both", padx=50)
+    def update_content(self, single_coord=None):
+        for widget in self.ranking_frame.winfo_children(): widget.destroy()
+        top_5 = self.data_handler.get_data().get('top_5', [])
+        if not top_5: tk.Label(self.ranking_frame, text="Aguardando Pontuação...", font=CONFIG["fonts"]["subtitle"], bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["text_dark"]).pack(); return
+        def animate_entry(index):
+            if index >= len(top_5): return
+            player = top_5[index]; pos, name = f"{index+1}º", player['Vendedor']
+            if len(name) > 28: name = name[:25] + "..."
+            text = f"{pos:<5}{name:<30}{int(player['Pontos']):>8} pts"
+            entry_frame = tk.Frame(self.ranking_frame, bg=CONFIG["colors"]["content_bg"])
+            entry_label = tk.Label(entry_frame, text=text, font=CONFIG["fonts"]["monospace"], bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["text_light"])
+            entry_label.pack()
+            entry_frame.place(relx=-1.0, rely=index * 0.15 + 0.1, anchor="w")
+            self.animation_job = self.after(50 + index * 50, lambda ef=entry_frame, i=index: ef.place(relx=0.5, rely=i * 0.15 + 0.1, anchor="center", relwidth=1.0) if ef.winfo_exists() else None)
+            self.animation_job = self.after(CONFIG["animation"]["ranking_slide_delay_ms"] + 50, lambda: animate_entry(index + 1))
+        animate_entry(0)
+
+class ChartScreen(BaseScreen):
+    # ... (código inalterado) ...
+    def build_ui(self):
+        self.title_label = tk.Label(self, text="JORNADA DA PERFORMANCE", font=CONFIG["fonts"]["title"], bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["primary"])
+        self.title_label.pack(pady=(20, 10))
+        self.canvas = tk.Canvas(self, bg=CONFIG["colors"]["content_bg"], highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+    def _draw_chart(self):
+        if not self.winfo_exists(): return
+        self.canvas.delete("all"); chart_data = self.data_handler.get_line_chart_data()
+        if not chart_data or len(self.data_handler.df) < 1: self.canvas.create_text(self.winfo_width()/2, self.winfo_height()/2, text="Coletando histórico...", font=CONFIG["fonts"]["subtitle"], fill=CONFIG["colors"]["text_dark"]); return
+        w, h = self.winfo_width(), self.winfo_height()
+        if w <= 1 or h <= 1: self.animation_job = self.after(100, self._draw_chart); return
+        margin = {'top': 40, 'bottom': 120, 'left': 60, 'right': 60}
+        all_points = [p[1] for points_list in chart_data.values() for p in points_list]; all_times = [p[0] for points_list in chart_data.values() for p in points_list]
+        min_score, max_score = (min(all_points), max(all_points)) if all_points else (0, 100); max_score = max_score if max_score > min_score else min_score + 1
+        min_time, max_time = (min(all_times), max(all_times)) if all_times else (datetime.now(), datetime.now())
+        self.canvas.create_line(margin['left'], h - margin['bottom'], w - margin['right'], h - margin['bottom'], fill=CONFIG["colors"]["text_dark"])
+        self.canvas.create_line(margin['left'], h - margin['bottom'], margin['left'], margin['top'], fill=CONFIG["colors"]["text_dark"])
+        def normalize(score, time):
+            time_delta = (max_time - min_time).total_seconds(); score_delta = max_score - min_score
+            x = margin['left'] + ((time - min_time).total_seconds() / time_delta) * (w - margin['left'] - margin['right']) if time_delta > 0 else margin['left']
+            y = h - margin['bottom'] - ((score - min_score) / score_delta) * (h - margin['top'] - margin['bottom'])
+            return int(x), int(y)
+        def animate_line(vendedor_data, color):
+            points = [normalize(p[1], p[0]) for p in vendedor_data]
+            def draw_segment(i):
+                if not self.winfo_exists(): return
+                if i >= len(points) - 1: return
+                self.canvas.create_line(points[i], points[i+1], fill=color, width=3)
+                self.animation_job = self.after(CONFIG["animation"]["chart_draw_speed_ms"], lambda: draw_segment(i+1))
+            if points: draw_segment(0)
+        legend_y = h - margin['bottom'] + 30; legend_item_width = (w - margin['left'] - margin['right']) / len(chart_data) if chart_data else 100
+        for i, (vendedor, data) in enumerate(chart_data.items()):
+            color = CONFIG["colors"]["chart_colors"][i % len(CONFIG["colors"]["chart_colors"])]
+            legend_x_start = margin['left'] + i * legend_item_width; rect_x = legend_x_start + 10; text_x = rect_x + 30
+            self.canvas.create_rectangle(rect_x, legend_y, rect_x + 20, legend_y + 20, fill=color, outline="")
+            max_text_width = legend_item_width - 50; display_name = vendedor
+            if len(vendedor) * 8 > max_text_width: cutoff = int(max_text_width / 8) - 3; display_name = vendedor[:cutoff] + "..." if cutoff > 5 else vendedor
+            self.canvas.create_text(text_x, legend_y + 10, text=display_name, anchor="w", fill=CONFIG["colors"]["text_light"], font=CONFIG["fonts"]["normal"])
+            if data: animate_line(data, color)
+    def update_content(self, single_coord=None):
+        if self.animation_job: self.after_cancel(self.animation_job)
+        self.animation_job = self.after(100, self._draw_chart)
+
+class CoordinatorScreen(BaseScreen):
+     # ... (código inalterado) ...
+    def build_ui(self):
+        self.title_label = tk.Label(self, text="DESEMPENHO POR EQUIPE", font=CONFIG["fonts"]["title"], bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["primary"])
+        self.title_label.pack(pady=(20, 10), fill="x")
+        self.all_teams_frame = tk.Frame(self, bg=CONFIG["colors"]["content_bg"])
+        all_teams_canvas = tk.Canvas(self.all_teams_frame, bg=CONFIG["colors"]["content_bg"], highlightthickness=0)
+        all_teams_scrollbar = tk.Scrollbar(self.all_teams_frame, orient="vertical", command=all_teams_canvas.yview)
+        self.all_teams_scrollable_frame = tk.Frame(all_teams_canvas, bg=CONFIG["colors"]["content_bg"])
+        self.all_teams_scrollable_frame.bind("<Configure>", lambda e: all_teams_canvas.configure(scrollregion=all_teams_canvas.bbox("all")))
+        all_teams_canvas.create_window((0, 0), window=self.all_teams_scrollable_frame, anchor="nw")
+        all_teams_canvas.configure(yscrollcommand=all_teams_scrollbar.set)
+        all_teams_canvas.pack(side="left", fill="both", expand=True)
+        all_teams_scrollbar.pack(side="right", fill="y")
+        self.single_team_frame = tk.Frame(self, bg=CONFIG["colors"]["content_bg"])
+        self.single_team_card = tk.LabelFrame(self.single_team_frame, text="", font=("Segoe UI", 20, "bold"), bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["secondary"], padx=40, pady=20, relief="solid", bd=1)
+        self.single_team_card.pack(expand=True)
+        all_teams_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+    def _on_mousewheel(self, event):
+        if self.all_teams_frame.winfo_ismapped(): canvas = self.all_teams_frame.winfo_children()[0]; canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+    def show(self, single_coord=None): self.pack(fill="both", expand=True); self.update_content(single_coord=single_coord)
+    def update_content(self, single_coord=None):
+        self.all_teams_frame.pack_forget(); self.single_team_frame.pack_forget()
+        for widget in self.all_teams_scrollable_frame.winfo_children(): widget.destroy()
+        for widget in self.single_team_card.winfo_children(): widget.destroy()
+        rankings = self.data_handler.get_data().get('coordinator_rankings', {})
+        if not rankings:
+            self.single_team_frame.pack(fill="both", expand=True, padx=20, pady=10)
+            tk.Label(self.single_team_card, text="Aguardando dados...", font=CONFIG["fonts"]["subtitle"], bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["text_dark"]).pack(expand=True, pady=50)
+            return
+        if single_coord:
+            self.single_team_frame.pack(fill="both", expand=True, padx=20, pady=10)
+            if single_coord in rankings:
+                salespeople = rankings[single_coord]; self.single_team_card.config(text=f" Equipe: {single_coord} ")
+                font_single_team = ("Consolas", 24, "bold")
+                for i, seller in enumerate(salespeople):
+                    pos, name = f"{i+1}º", seller['Vendedor']; name = name[:22] + "..." if len(name) > 25 else name
+                    text = f"{pos:<5}{name:<30}{int(seller['Pontos']):>8} pts"
+                    tk.Label(self.single_team_card, text=text, font=font_single_team, bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["text_light"]).pack(anchor="w", pady=3)
+                self.single_team_card.lower(); self.after(100, self.single_team_card.lift)
+            else: tk.Label(self.single_team_card, text=f"Equipe '{single_coord}' não encontrada.", font=CONFIG["fonts"]["subtitle"], bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["text_dark"]).pack(expand=True, pady=50)
+        else:
+            self.all_teams_frame.pack(fill="both", expand=True, padx=20, pady=10)
+            items_to_display = list(rankings.items())
+            def animate_card(index, coord_items):
+                if index >= len(coord_items): return
+                coord_name, salespeople = coord_items[index]
+                card = tk.LabelFrame(self.all_teams_scrollable_frame, text=f" Equipe: {coord_name} ", font=CONFIG["fonts"]["normal_bold"], bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["secondary"], padx=20, pady=10, relief="solid", bd=1)
+                card.pack(pady=15, padx=20, fill="x")
+                for i, seller in enumerate(salespeople):
+                    pos, name = f"{i+1}º", seller['Vendedor']; name = name[:32] + "..." if len(name) > 35 else name
+                    text = f"{pos:<5}{name:<40}{int(seller['Pontos']):>8} pts"
+                    tk.Label(card, text=text, font=CONFIG["fonts"]["monospace"], bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["text_light"]).pack(anchor="w")
+                card.lower(); self.after(50 + index * 50, card.lift)
+                if not single_coord: self.animation_job = self.after(150, lambda: animate_card(index + 1, coord_items))
+            animate_card(0, items_to_display)
+
+class AchievementsScreen(BaseScreen):
+    # ... (código inalterado) ...
+    def build_ui(self):
+        self.title_label = tk.Label(self, text="MURAL DE CONQUISTAS", font=CONFIG["fonts"]["title"], bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["primary"])
+        self.title_label.pack(pady=(20, 30))
+        self.achievement_frame = tk.Frame(self, bg=CONFIG["colors"]["content_bg"])
+        self.achievement_frame.pack(expand=True, fill="both", padx=50)
+    def update_content(self, single_coord=None):
+        for widget in self.achievement_frame.winfo_children(): widget.destroy()
+        achievements = self.data_handler.get_data().get('achievements', [])
+        if not achievements: tk.Label(self.achievement_frame, text="Nenhuma conquista.", font=CONFIG["fonts"]["subtitle"], bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["text_dark"]).pack(expand=True); return
+        def animate_card(index):
+            if index >= len(achievements): return
+            ach = achievements[index]
+            card = tk.Frame(self.achievement_frame, bg=CONFIG["colors"]["sidebar_bg"], relief="solid", bd=1)
+            icon = tk.Label(card, text=ach["icon"], font=("Segoe UI", 30), bg=CONFIG["colors"]["sidebar_bg"], fg=CONFIG["colors"]["secondary"])
+            icon.pack(side="left", padx=20, pady=10)
+            text_frame = tk.Frame(card, bg=CONFIG["colors"]["sidebar_bg"])
+            text_frame.pack(side="left", expand=True, fill="x")
+            title = tk.Label(text_frame, text=f"{ach['title']} - {ach['vendedor']}", font=CONFIG["fonts"]["subtitle"], bg=CONFIG["colors"]["sidebar_bg"], fg=CONFIG["colors"]["text_light"], anchor="w")
+            title.pack(fill="x")
+            desc = tk.Label(text_frame, text=ach["desc"], font=CONFIG["fonts"]["normal"], bg=CONFIG["colors"]["sidebar_bg"], fg=CONFIG["colors"]["text_dark"], anchor="w")
+            desc.pack(fill="x")
+            card.pack(pady=10, fill="x"); card.lower(); self.after(50 + index * 50, card.lift)
+            self.animation_job = self.after(150, lambda: animate_card(index + 1))
+        animate_card(0)
+
+class ClockScreen(BaseScreen):
+    # ... (código inalterado) ...
+    def build_ui(self):
+        self.clock_job = None
+        self.time_label = tk.Label(self, font=("Segoe UI Black", 120, "bold"), bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["text_light"])
+        self.time_label.pack(expand=True)
+        self.greeting_label = tk.Label(self, font=CONFIG["fonts"]["title"], bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["primary"])
+        self.greeting_label.pack(expand=True)
+    def update_clock(self):
+        now = datetime.now(); self.time_label.config(text=now.strftime("%H:%M:%S"))
+        hour = now.hour; greeting = "Boa noite!"; greeting = "Bom dia!" if 5 <= hour < 12 else "Boa tarde!" if 12 <= hour < 18 else greeting
+        self.greeting_label.config(text=greeting)
+        self.clock_job = self.after(1000, self.update_clock)
+    def show(self, single_coord=None): super().show(); self.update_clock()
+    def hide(self):
+        if self.clock_job: self.after_cancel(self.clock_job); self.clock_job = None
+        super().hide()
+    def update_content(self, single_coord=None): pass
+
+class ChronicleScreen(BaseScreen):
+    # ... (código inalterado) ...
+    def build_ui(self):
+        self.title_label = tk.Label(self, text="CRÔNICA DA LIDERANÇA", font=CONFIG["fonts"]["title"], bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["primary"])
+        self.title_label.pack(pady=(20, 10), fill="x")
+        main_frame = tk.Frame(self, bg=CONFIG["colors"]["content_bg"])
+        main_frame.pack(fill="both", expand=True, padx=20, pady=10)
+        self.canvas = tk.Canvas(main_frame, bg=CONFIG["colors"]["content_bg"], highlightthickness=0)
+        scrollbar = tk.Scrollbar(main_frame, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = tk.Frame(self.canvas, bg=CONFIG["colors"]["content_bg"])
+        self.scrollable_frame.bind("<Configure>", self._on_frame_configure)
+        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw", tags="frame")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        # scrollbar.pack(side="right", fill="y") # Removido
+        self.bind_all("<MouseWheel>", self._on_mousewheel_stop_scroll)
+        self.is_auto_scrolling = False; self.auto_scroll_job = None
+    def _on_frame_configure(self, event=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all")); self.canvas.itemconfig("frame", width=self.canvas.winfo_width())
+    def _on_mousewheel_stop_scroll(self, event):
+        if self.is_auto_scrolling: self._stop_auto_scroll()
+        if self.winfo_ismapped(): self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+    def _start_auto_scroll(self): self.is_auto_scrolling = True; self._auto_scroll_step()
+    def _stop_auto_scroll(self):
+        self.is_auto_scrolling = False;
+        if self.auto_scroll_job: self.after_cancel(self.auto_scroll_job); self.auto_scroll_job = None
+    def _auto_scroll_step(self):
+        if not self.is_auto_scrolling or not self.winfo_exists(): return
+        current_y_fraction = self.canvas.yview()[1]
+        if current_y_fraction < 1.0: self.canvas.yview_scroll(1, "units"); self.auto_scroll_job = self.after(50, self._auto_scroll_step)
+        else: self.is_auto_scrolling = False
+    def show(self, single_coord=None): super().show(); self.after(1500, self._start_auto_scroll)
+    def hide(self): self._stop_auto_scroll(); super().hide()
+    def _show_details_popup(self, event_data):
+        popup = tk.Toplevel(self); popup.title("Detalhes"); popup.geometry("600x300"); popup.configure(bg=CONFIG["colors"]["sidebar_bg"])
+        popup.transient(self.winfo_toplevel()); popup.grab_set()
+        tk.Label(popup, text=event_data["text"], font=CONFIG["fonts"]["normal_bold"], wraplength=550, bg=CONFIG["colors"]["sidebar_bg"], fg=CONFIG["colors"]["text_light"], justify="left").pack(pady=20, padx=20)
+        tk.Label(popup, text=f"Data: {event_data['timestamp'].strftime('%d/%m/%Y às %H:%M:%S')}", font=CONFIG["fonts"]["normal"], bg=CONFIG["colors"]["sidebar_bg"], fg=CONFIG["colors"]["text_dark"]).pack(pady=5, padx=20)
+        details_frame = tk.LabelFrame(popup, text=" Detalhes ", font=CONFIG["fonts"]["normal_bold"], bg=CONFIG["colors"]["sidebar_bg"], fg=CONFIG["colors"]["text_light"], padx=10, pady=10)
+        details_frame.pack(pady=10, padx=20, fill="x")
+        tk.Label(details_frame, text=event_data.get("details", "-"), font=CONFIG["fonts"]["normal"], bg=CONFIG["colors"]["sidebar_bg"], fg=CONFIG["colors"]["secondary"], wraplength=500, justify="left").pack()
+        tk.Button(popup, text="Fechar", command=popup.destroy, font=CONFIG["fonts"]["normal_bold"], bg=CONFIG["colors"]["primary"], fg=CONFIG["colors"]["background"], relief="flat").pack(pady=20)
+    def update_content(self, single_coord=None):
+        for widget in self.scrollable_frame.winfo_children(): widget.destroy()
+        history = self.data_handler.get_data().get('history', [])
+        self.canvas.yview_moveto(0); self._stop_auto_scroll()
+        if not history: tk.Label(self.scrollable_frame, text="História Vazia...", font=CONFIG["fonts"]["subtitle"], bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["text_dark"]).pack(expand=True, pady=50); return
+        icon_map = {"takeover": "👑", "score_update": "⭐"}
+        for event in history:
+            outer_frame = tk.Frame(self.scrollable_frame, bg=CONFIG["colors"]["content_bg"]); outer_frame.pack(pady=8, padx=50, fill='x')
+            card = tk.Frame(outer_frame, bg=CONFIG["colors"]["sidebar_bg"], relief="solid", bd=1); card.pack()
+            icon_label = tk.Label(card, text=icon_map.get(event["type"], "📜"), font=("Segoe UI", 24), bg=CONFIG["colors"]["sidebar_bg"], fg=CONFIG["colors"]["secondary"])
+            icon_label.pack(side="left", padx=15, pady=15)
+            text_frame = tk.Frame(card, bg=CONFIG["colors"]["sidebar_bg"]); text_frame.pack(side="left", expand=True, fill="x", pady=10)
+            main_label = tk.Label(text_frame, text=event["text"], font=CONFIG["fonts"]["normal_bold"], wraplength=600, bg=CONFIG["colors"]["sidebar_bg"], fg=CONFIG["colors"]["text_light"], anchor="w", justify="left")
+            main_label.pack(fill="x")
+            sub_text = f"Total: {int(event['points'])} pontos • às {event['timestamp'].strftime('%H:%M:%S')}"
+            sub_label = tk.Label(text_frame, text=sub_text, font=CONFIG["fonts"]["normal"], bg=CONFIG["colors"]["sidebar_bg"], fg=CONFIG["colors"]["text_dark"], anchor="w")
+            sub_label.pack(fill="x")
+            if event.get("details"):
+                card.config(cursor="hand2")
+                for widget in [card, icon_label, text_frame, main_label, sub_label]: widget.bind("<Button-1>", lambda e, ev=event: self._show_details_popup(ev))
+        self.after(1500, self._start_auto_scroll)
+
+
+class PontuarScreen(BaseScreen):
+    # ... (código inalterado) ...
+    def build_ui(self):
+        self.title_label = tk.Label(self, text="REGISTRAR PONTUAÇÃO", font=CONFIG["fonts"]["title"], bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["primary"])
+        self.title_label.pack(pady=(20, 15))
+        main_frame = tk.Frame(self, bg=CONFIG["colors"]["content_bg"]); main_frame.pack(expand=True)
+        entry_frame = tk.Frame(main_frame, bg=CONFIG["colors"]["content_bg"]); entry_frame.pack(pady=10)
+        tk.Label(entry_frame, text="Nome Vendedor:", font=CONFIG["fonts"]["normal_bold"], bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["text_light"]).grid(row=0, column=0, sticky="w", padx=10, pady=5)
+        self.vendedor_var = tk.StringVar(); self.vendedor_entry = tk.Entry(entry_frame, textvariable=self.vendedor_var, font=CONFIG["fonts"]["normal"], width=40)
+        self.vendedor_entry.grid(row=1, column=0, padx=10, pady=5)
+        self.autocomplete_listbox = tk.Listbox(entry_frame, font=CONFIG["fonts"]["normal"], width=40)
+        self.vendedor_entry.bind("<KeyRelease>", self._on_vendedor_keyup); self.autocomplete_listbox.bind("<<ListboxSelect>>", self._on_vendedor_select)
+        tk.Label(entry_frame, text="ID Cliente:", font=CONFIG["fonts"]["normal_bold"], bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["text_light"]).grid(row=0, column=1, sticky="w", padx=10, pady=5)
+        self.cliente_id_entry = tk.Entry(entry_frame, font=CONFIG["fonts"]["normal"], width=20); self.cliente_id_entry.grid(row=1, column=1, sticky="w", padx=10, pady=5)
+        actions_frame = tk.LabelFrame(main_frame, text=" Ações ", font=CONFIG["fonts"]["normal_bold"], bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["text_light"], padx=20, pady=10)
+        actions_frame.pack(pady=20)
+        self.action_vars = {}
+        for i, (action, points) in enumerate(CONFIG["scoring_actions"].items()):
+            var = tk.IntVar(); chk = tk.Checkbutton(actions_frame, text=f"{action} ({points} pts)", variable=var, font=CONFIG["fonts"]["normal"], bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["text_light"], selectcolor=CONFIG["colors"]["background"], activebackground=CONFIG["colors"]["content_bg"], activeforeground=CONFIG["colors"]["text_light"], command=self._update_total_points)
+            chk.grid(row=i, column=0, sticky="w", padx=5, pady=2); self.action_vars[action] = var
+        self.total_points_label = tk.Label(main_frame, text="Total: 0 Pontos", font=CONFIG["fonts"]["subtitle"], bg=CONFIG["colors"]["content_bg"], fg=CONFIG["colors"]["secondary"]); self.total_points_label.pack(pady=10)
+        submit_button = tk.Button(main_frame, text="Enviar Pontuação", font=CONFIG["fonts"]["normal_bold"], bg=CONFIG["colors"]["primary"], fg=CONFIG["colors"]["background"], relief="flat", command=self._submit_score, width=40); submit_button.pack(pady=20)
+    def _update_total_points(self): total = sum(CONFIG["scoring_actions"][action] for action, var in self.action_vars.items() if var.get() == 1); self.total_points_label.config(text=f"Total: {total} Pontos")
+    def _reset_form(self): self.vendedor_var.set(""); self.cliente_id_entry.delete(0, tk.END); [var.set(0) for var in self.action_vars.values()]; self._update_total_points()
+    def _on_vendedor_keyup(self, event):
+        typed_text = self.vendedor_var.get().lower(); self.autocomplete_listbox.grid_forget()
+        if not typed_text: return
+        vendedores = self.data_handler.df_clients["Vendedor"].dropna().unique(); matches = [v for v in vendedores if typed_text in v.lower()]
+        self.autocomplete_listbox.delete(0, tk.END)
+        if matches: [self.autocomplete_listbox.insert(tk.END, match) for match in matches]; self.autocomplete_listbox.grid(row=2, column=0, sticky="nsew", padx=10)
+    def _on_vendedor_select(self, event):
+        if not self.autocomplete_listbox.curselection(): return
+        self.vendedor_var.set(self.autocomplete_listbox.get(self.autocomplete_listbox.curselection())); self.autocomplete_listbox.grid_forget()
+    def _submit_score(self):
+        vendedor, cliente_id = self.vendedor_var.get(), self.cliente_id_entry.get()
+        if not vendedor or not cliente_id: messagebox.showerror("Erro", "Vendedor e ID Cliente obrigatórios!"); return
+        total_points, details_list = 0, []; [(total_points := total_points + CONFIG["scoring_actions"][action], details_list.append(f"{CONFIG['scoring_actions'][action]} pts ({action})")) for action, var in self.action_vars.items() if var.get() == 1]
+        if total_points == 0: messagebox.showerror("Erro", "Nenhuma ação selecionada!"); return
+        nome_cliente, vendedor_associado = self.data_handler.get_client_info(cliente_id)
+        if not nome_cliente: messagebox.showerror("Erro", f"ID '{cliente_id}' não encontrado."); return
+        if vendedor != vendedor_associado and not messagebox.askyesno("Aviso", f"'{vendedor}' não é o responsável por '{nome_cliente}' (Resp: {vendedor_associado}).\nContinuar?"): return
+        if self.data_handler.add_score(vendedor, total_points):
+            details_text = ", ".join(details_list); event_text = f"{vendedor} pontuou {total_points} com {nome_cliente}."
+            self.data_handler.add_score_event_to_history(event_text, total_points, details_text)
+            messagebox.showinfo("Sucesso", "Pontuação registrada!"); self._reset_form()
+        else: messagebox.showerror("Erro", f"Não foi possível salvar.\nVendedor '{vendedor}' encontrado?")
+
+# =============================================================================
+# 4. APLICATIVO PRINCIPAL DO DASHBOARD (COM TELA CHEIA E SCREENSHOTS MELHORADOS)
+# =============================================================================
+# =============================================================================
+# 4. APLICATIVO PRINCIPAL DO DASHBOARD (COM TELA CHEIA E SCREENSHOTS MELHORADOS)
+# =============================================================================
+class DashboardApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title(CONFIG["window"]["title"])
+        self.root.geometry(CONFIG["window"]["geometry"])
+        self.root.configure(bg=CONFIG["colors"]["background"])
+
+        scores_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG["file_paths"]["excel"])
+        clients_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG["file_paths"]["clients"])
+        self.data_handler = DataHandler(scores_path, clients_path)
+
+        self.file_watcher = self._setup_file_watcher() # Make sure this is defined
+        self._create_main_layout() # Make sure this is defined
+
+        self.screens = {
+            "leader": LeaderScreen(self.content_frame, self.data_handler),
+            "ranking": RankingScreen(self.content_frame, self.data_handler),
+            "chart": ChartScreen(self.content_frame, self.data_handler),
+            "coordinators": CoordinatorScreen(self.content_frame, self.data_handler),
+            "achievements": AchievementsScreen(self.content_frame, self.data_handler),
+            "chronicle": ChronicleScreen(self.content_frame, self.data_handler),
+            "clock": ClockScreen(self.content_frame, self.data_handler),
+            "score": PontuarScreen(self.content_frame, self.data_handler)
+        }
+        self.current_screen = None
+
+        self.is_presentation_mode = False
+        self.slideshow_job = None
+        self.slideshow_order = ["leader", "ranking", "coordinators", "chart", "achievements", "chronicle"]
+        self.slideshow_index = 0
+        self.coordinator_slideshow_index = 0
+        self.current_coordinator_list = []
+
+        # Estado da tela cheia
+        self.is_fullscreen = False
+
+        self.create_sidebar_buttons()
+        self.show_screen("leader")
+
+        self.periodic_update()
+        self._setup_scheduler()
+
+    # --- MÉTODO PARA TELA CHEIA ---
+    def toggle_fullscreen(self, event=None):
+        """Entra ou sai do modo de tela cheia."""
+        self.is_fullscreen = not self.is_fullscreen
+        self.root.attributes("-fullscreen", self.is_fullscreen)
+        print(f"Tela cheia: {'Ligada' if self.is_fullscreen else 'Desligada'}")
+
+    # --- Métodos de Configuração e Layout ---
+    def _setup_file_watcher(self):
+        """Configura o monitoramento de modificações no arquivo Excel."""
+        class ExcelEventHandler(FileSystemEventHandler):
+            def __init__(self, data_handler):
+                self.data_handler = data_handler
+            def on_modified(self, event):
+                if event.src_path.endswith(CONFIG["file_paths"]["excel"]):
+                    print(f"Modificação detectada em: {event.src_path}")
+                    self.data_handler.update_flag = True
+            def on_created(self, event):
+                if event.src_path.endswith(CONFIG["file_paths"]["excel"]):
+                    print(f"Arquivo criado/recriado: {event.src_path}")
+                    self.data_handler.update_flag = True
+        observer = Observer()
+        observer.schedule(ExcelEventHandler(self.data_handler), path=os.path.dirname(os.path.abspath(__file__)), recursive=False)
+        observer.start()
+        print("Monitoramento de arquivo iniciado.")
+        return observer
+
+    def _create_main_layout(self):
+        """Cria os frames principais da interface (barra lateral e conteúdo)."""
+        self.sidebar_frame = tk.Frame(self.root, bg=CONFIG["colors"]["sidebar_bg"], width=250)
+        self.sidebar_frame.pack(side="left", fill="y")
+        self.sidebar_frame.pack_propagate(False) # Impede que o frame encolha
+
+        self.content_frame = tk.Frame(self.root, bg=CONFIG["colors"]["content_bg"])
+        self.content_frame.pack(side="right", fill="both", expand=True)
+
+        # Título na Sidebar
+        tk.Label(self.sidebar_frame, text="RODOLUB", font=CONFIG["fonts"]["title"], bg=CONFIG["colors"]["sidebar_bg"], fg=CONFIG["colors"]["primary"]).pack(pady=20)
+        tk.Frame(self.sidebar_frame, height=2, bg=CONFIG["colors"]["primary"]).pack(fill="x", padx=10) # Linha divisória
+
+    def create_sidebar_buttons(self):
+        """Cria todos os botões na barra lateral."""
+        buttons = {
+            "leader": "Líder", "ranking": "Ranking", "coordinators": "Coordenadores", "chart": "Gráfico",
+            "achievements": "Conquistas", "chronicle": "Crônica", "clock": "Relógio", "score": "Pontuar"
+        }
+        self.nav_buttons = {}
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG["file_paths"]["icons_folder"])
+
+        # Botões de Navegação
+        for name, text in buttons.items():
+            icon = None
+            try:
+                img = Image.open(os.path.join(icon_path, f"{name}.png")).resize((30, 30), Image.Resampling.LANCZOS)
+                icon = ImageTk.PhotoImage(img)
+            except Exception: pass # Ignora erro se ícone não existe
+            btn = tk.Button(self.sidebar_frame, text=f"  {text}", image=icon, compound="left", font=CONFIG["fonts"]["normal_bold"], bg=CONFIG["colors"]["sidebar_bg"], fg=CONFIG["colors"]["text_light"], relief="flat", anchor="w", command=lambda n=name: self.show_screen(n))
+            btn.image = icon # Keep reference
+            btn.pack(fill="x", pady=5, padx=10)
+            self.nav_buttons[name] = btn
+            btn.bind("<Enter>", lambda e, b=btn: b.config(bg=CONFIG["colors"]["button_hover"]))
+            btn.bind("<Leave>", lambda e, b=btn: b.config(bg=CONFIG["colors"]["sidebar_bg"]))
+
+        # Separador
+        tk.Frame(self.sidebar_frame, height=2, bg=CONFIG["colors"]["button_hover"]).pack(fill="x", padx=10, pady=(15,5))
+
+        # Botão Tela Cheia
+        fs_icon = None
+        try: fs_img = Image.open(os.path.join(icon_path, "fullscreen.png")).resize((30, 30), Image.Resampling.LANCZOS); fs_icon = ImageTk.PhotoImage(fs_img)
+        except Exception: pass
+        self.fullscreen_button = tk.Button(self.sidebar_frame, text="  Tela Cheia", image=fs_icon, compound="left", font=CONFIG["fonts"]["normal_bold"], bg=CONFIG["colors"]["sidebar_bg"], fg=CONFIG["colors"]["text_light"], relief="flat", anchor="w", command=self.toggle_fullscreen)
+        self.fullscreen_button.image = fs_icon; self.fullscreen_button.pack(fill="x", pady=5, padx=10)
+        self.fullscreen_button.bind("<Enter>", lambda e, b=self.fullscreen_button: b.config(bg=CONFIG["colors"]["button_hover"])); self.fullscreen_button.bind("<Leave>", lambda e, b=self.fullscreen_button: b.config(bg=CONFIG["colors"]["sidebar_bg"]))
+
+        # Botão Modo Apresentação
+        pres_icon = None
+        try: pres_img = Image.open(os.path.join(icon_path, "presentation.png")).resize((30, 30), Image.Resampling.LANCZOS); pres_icon = ImageTk.PhotoImage(pres_img)
+        except Exception: pass
+        self.presentation_button = tk.Button(self.sidebar_frame, text="  Modo Apresentação", image=pres_icon, compound="left", font=CONFIG["fonts"]["normal_bold"], bg=CONFIG["colors"]["sidebar_bg"], fg=CONFIG["colors"]["text_light"], relief="flat", anchor="w", command=self.toggle_presentation_mode)
+        self.presentation_button.image = pres_icon; self.presentation_button.pack(fill="x", pady=5, padx=10)
+        self.presentation_button.bind("<Enter>", lambda e, b=self.presentation_button: b.config(bg=CONFIG["colors"]["button_hover"])); self.presentation_button.bind("<Leave>", lambda e, b=self.presentation_button: b.config(bg=CONFIG["colors"]["sidebar_bg"]))
+
+        # Botão Email Teste
+        test_email_icon = None
+        try: test_img = Image.open(os.path.join(icon_path, "email_test.png")).resize((30, 30), Image.Resampling.LANCZOS); test_email_icon = ImageTk.PhotoImage(test_img)
+        except Exception: pass
+        self.test_email_button = tk.Button(self.sidebar_frame, text="  Enviar Email Teste", image=test_email_icon, compound="left", font=CONFIG["fonts"]["normal_bold"], bg=CONFIG["colors"]["sidebar_bg"], fg="#FFA500", relief="flat", anchor="w", command=self._run_threaded_report_task)
+        self.test_email_button.image = test_email_icon; self.test_email_button.pack(fill="x", pady=5, padx=10)
+        self.test_email_button.bind("<Enter>", lambda e, b=self.test_email_button: b.config(bg=CONFIG["colors"]["button_hover"])); self.test_email_button.bind("<Leave>", lambda e, b=self.test_email_button: b.config(bg=CONFIG["colors"]["sidebar_bg"]))
+
+    # --- Métodos de Controle de Tela e Modos ---
+    def show_screen(self, screen_name, single_coord=None):
+        """Mostra a tela especificada, escondendo a anterior."""
+        if self.current_screen:
+            self.current_screen.hide()
+            current_name = self.get_current_screen_name()
+            # Só atualiza cor do botão se não estiver em modo apresentação e botão existir
+            if not self.is_presentation_mode and current_name in self.nav_buttons:
+                self.nav_buttons[current_name].config(bg=CONFIG["colors"]["sidebar_bg"])
+
+        self.current_screen = self.screens[screen_name]
+
+        # Passa argumento extra para CoordinatorScreen
+        if screen_name == "coordinators":
+            self.current_screen.show(single_coord=single_coord)
+        else:
+            self.current_screen.show() # Chama show sem argumento extra
+
+        # Destaca o botão da tela atual, se aplicável
+        if not self.is_presentation_mode and screen_name in self.nav_buttons:
+            self.nav_buttons[screen_name].config(bg=CONFIG["colors"]["content_bg"])
+
+    def get_current_screen_name(self):
+        """Retorna a chave (nome) da tela atualmente visível."""
+        for name, screen in self.screens.items():
+            if screen == self.current_screen:
+                return name
+        return None
+
+    def toggle_presentation_mode(self):
+        """Ativa ou desativa o modo de apresentação (slideshow automático)."""
+        self.is_presentation_mode = not self.is_presentation_mode
+        if self.is_presentation_mode:
+            # Esconde a barra lateral e inicia o ciclo
+            self.sidebar_frame.pack_forget()
+            self.slideshow_index = 0
+            self.coordinator_slideshow_index = 0
+            self.current_coordinator_list = []
+            self._cycle_screens()
+        else:
+            # Para o ciclo e mostra a barra lateral
+            if self.slideshow_job:
+                self.root.after_cancel(self.slideshow_job)
+                self.slideshow_job = None
+            self.sidebar_frame.pack(side="left", fill="y")
+            # Mostra a tela que deveria estar visível (ou 'leader' como fallback)
+            current_intended_screen = self.get_current_screen_name() or "leader"
+            self.show_screen(current_intended_screen)
+
+    def _cycle_screens(self):
+        """Motor do slideshow: avança para a próxima tela ou próximo coordenador."""
+        if not self.is_presentation_mode: return # Para se saiu do modo
+
+        current_screen_key = self.slideshow_order[self.slideshow_index]
+        next_interval_ms = CONFIG["slideshow_interval_seconds"] * 1000
+
+        if current_screen_key == "coordinators":
+            if not self.current_coordinator_list: # Carrega lista na primeira vez
+                rankings = self.data_handler.get_data().get('coordinator_rankings', {})
+                self.current_coordinator_list = list(rankings.keys())
+                self.coordinator_slideshow_index = 0
+
+            if self.current_coordinator_list and self.coordinator_slideshow_index < len(self.current_coordinator_list):
+                coord_name = self.current_coordinator_list[self.coordinator_slideshow_index]
+                self.show_screen("coordinators", single_coord=coord_name)
+                self.coordinator_slideshow_index += 1
+                next_interval_ms = CONFIG["coordinator_slideshow_seconds"] * 1000 # Intervalo curto
+                # Não avança self.slideshow_index ainda
+            else: # Todos os coordenadores mostrados
+                self.slideshow_index = (self.slideshow_index + 1) % len(self.slideshow_order)
+                next_screen_key = self.slideshow_order[self.slideshow_index]
+                self.show_screen(next_screen_key)
+                self.current_coordinator_list = [] # Reseta para próximo ciclo
+                self.coordinator_slideshow_index = 0
+        else: # Outras telas
+            self.show_screen(current_screen_key)
+            self.slideshow_index = (self.slideshow_index + 1) % len(self.slideshow_order)
+            self.current_coordinator_list = [] # Reseta caso venha da tela de coordenadores
+            self.coordinator_slideshow_index = 0
+
+        self.slideshow_job = self.root.after(next_interval_ms, self._cycle_screens)
+
+    # --- Métodos de Screenshot e Email ---
+    def _take_screenshot(self, target_widget, filename):
+        """Tira screenshot do widget especificado (geralmente self.root) e salva."""
+        screenshots_dir = CONFIG["file_paths"]["screenshots_folder"]
+        if not os.path.exists(screenshots_dir): os.makedirs(screenshots_dir)
+        filepath = os.path.abspath(os.path.join(screenshots_dir, filename))
+        try:
+            target_widget.update_idletasks() # Atualiza dimensões
+            x = target_widget.winfo_rootx()
+            y = target_widget.winfo_rooty()
+            w = target_widget.winfo_width()
+            h = target_widget.winfo_height()
+            if w <= 1 or h <= 1: time.sleep(1); x,y,w,h = target_widget.winfo_rootx(), target_widget.winfo_rooty(), target_widget.winfo_width(), target_widget.winfo_height() # Tenta de novo
+            if w > 1 and h > 1:
+                print(f"Capturando área: X={x}, Y={y}, W={w}, H={h} para {filename}")
+                bbox = (x, y, x + w, y + h)
+                im = ImageGrab.grab(bbox=bbox)
+                im.save(filepath)
+                print(f"Screenshot salvo: {filepath}")
+                return filepath
+            else: print(f"ERRO FATAL: Dimensões inválidas para screenshot {filename}. W={w}, H={h}"); return None
+        except Exception as e: print(f"ERRO ao tirar screenshot '{filename}': {e}"); return None
+
+    def _send_outlook_email(self, recipient, subject, body, attachments=None):
+        """Envia email via Outlook, incluindo assinatura padrão e aviso automático."""
+        if attachments is None: attachments = []
+        try:
+            outlook = win32.Dispatch('outlook.application')
+            mail = outlook.CreateItem(0); mail.To = recipient; mail.Subject = subject
+            full_body = body + "\n\n---\n" + \
+                        "Este é um e-mail automático enviado pelo sistema de Dashboard de Performance." + \
+                        CONFIG["email_settings"]["body_footer"]
+            try: mail.HTMLBody = f"<html><body>{full_body.replace(chr(10), '<br>').replace(chr(13), '')}</body></html>"
+            except Exception: mail.Body = full_body # Fallback
+            for attachment_path in attachments:
+                if attachment_path and os.path.exists(attachment_path): mail.Attachments.Add(attachment_path)
+                else: print(f"Aviso: Anexo não encontrado: {attachment_path}")
+            mail.Send()
+            print(f"Email enviado para: {recipient}"); return True
+        except AttributeError as e_attr: print(f"ERRO Outlook: {e_attr}. Verifique se está aberto/configurado."); return False
+        except Exception as e: print(f"ERRO GERAL ao enviar email para {recipient}: {e}"); return False
+
+    def _send_daily_reports_task(self):
+        """Tarefa agendada para emails: ajusta tela, tira screenshots, envia, restaura."""
+        pythoncom.CoInitialize()
+        try:
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Iniciando envio de relatórios diários...")
+            RENDER_DELAY_MS = 2500
+
+            initial_fullscreen_state = self.is_fullscreen
+            initial_presentation_state = self.is_presentation_mode
+
+            # Entra no estado de captura (agendado na thread principal)
+            event_set_mode = threading.Event()
+            def task_set_mode():
+                if not self.is_fullscreen: self.toggle_fullscreen()
+                if not self.is_presentation_mode: self.toggle_presentation_mode()
+                self.root.update(); event_set_mode.set()
+            self.root.after(0, task_set_mode); event_set_mode.wait(timeout=5)
+            print("Entrou em modo Tela Cheia/Apresentação para screenshots.")
+            time.sleep(1.5)
+
+            screenshots_dir = CONFIG["file_paths"]["screenshots_folder"]
+            boss_attachments = []
+
+            def take_screenshot_on_main_thread(screen_name, filename, single_coord=None):
+                img_path = None; event_capture = threading.Event()
+                def capture_task(): nonlocal img_path; img_path = self._take_screenshot(self.root, filename); event_capture.set()
+                def show_and_schedule_capture():
+                    self.show_screen(screen_name, single_coord=single_coord); self.root.update_idletasks(); self.root.update()
+                    self.root.after(RENDER_DELAY_MS, capture_task)
+                self.root.after(0, show_and_schedule_capture)
+                if not event_capture.wait(timeout=RENDER_DELAY_MS + 5): print(f"ERRO: Timeout screenshot {screen_name}"); return None
+                return img_path
+
+            # Tira Screenshots
+            print("Capturando tela do Líder..."); leader_img = take_screenshot_on_main_thread("leader", "leader_report.png");
+            if leader_img: boss_attachments.append(leader_img)
+            print("Capturando tela do Ranking..."); ranking_img = take_screenshot_on_main_thread("ranking", "ranking_report.png");
+            if ranking_img: boss_attachments.append(ranking_img)
+
+            # Envia para Chefe
+            if boss_attachments: self._send_outlook_email(CONFIG["email_settings"]["boss_email"], CONFIG["email_settings"]["subject"], CONFIG["email_settings"]["body_header"] + "\n- Visão Geral (Líder e Top 5)", boss_attachments)
+            else: print("Nenhum screenshot geral gerado.")
+
+            # Envia para Coordenadores
+            rankings = self.data_handler.get_data().get('coordinator_rankings', {}); coordinator_emails = CONFIG["email_settings"]["coordinator_emails"]
+            for coord_name in rankings:
+                print(f"Capturando relatório para: {coord_name}")
+                coord_img = take_screenshot_on_main_thread("coordinators", f"coord_{coord_name.replace(' ', '_')}.png", single_coord=coord_name)
+                recipient = coordinator_emails.get(coord_name)
+                if recipient and coord_img: self._send_outlook_email(recipient, CONFIG["email_settings"]["subject"] + f" - Equipe {coord_name}", CONFIG["email_settings"]["body_header"] + f"\n- Desempenho da sua equipe ({coord_name})", [coord_img])
+                elif not recipient: print(f"Aviso: Email não config para '{coord_name}'.")
+                elif not coord_img: print(f"Aviso: Falha screenshot para '{coord_name}'.")
+
+            # Limpeza
+            try: [os.remove(os.path.join(screenshots_dir, f)) for f in os.listdir(screenshots_dir) if f.endswith(".png")]; print("Screenshots temp removidos.")
+            except Exception as e: print(f"Aviso: Não remover screenshots: {e}")
+
+        finally:
+            # Restaura estado (agendado na thread principal)
+            event_restore = threading.Event()
+            def task_restore():
+                print("Restaurando estado da janela...")
+                if not initial_presentation_state and self.is_presentation_mode: self.toggle_presentation_mode()
+                if not initial_fullscreen_state and self.is_fullscreen: self.toggle_fullscreen()
+                self.root.update(); self.show_screen("leader"); print("Estado restaurado."); event_restore.set()
+            self.root.after(50, task_restore); event_restore.wait(timeout=5)
+            pythoncom.CoUninitialize()
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Envio de relatórios diários concluído.")
+
+    # --- Métodos de Agendamento e Loop Principal ---
+    def _run_threaded_report_task(self):
+        """Inicia a tarefa de envio de email em uma nova thread."""
+        report_thread = threading.Thread(target=self._send_daily_reports_task)
+        report_thread.start()
+
+    def _check_schedule(self):
+        """Verifica o agendador a cada minuto."""
+        schedule.run_pending()
+        self.root.after(60000, self._check_schedule)
+
+    def _setup_scheduler(self):
+        """Configura o agendamento de envio de emails."""
+        send_time = CONFIG["email_settings"]["send_time"]
+        print(f"Agendando envio de emails para as {send_time} (Seg-Sex).")
+        schedule.every().monday.at(send_time).do(self._run_threaded_report_task)
+        schedule.every().tuesday.at(send_time).do(self._run_threaded_report_task)
+        schedule.every().wednesday.at(send_time).do(self._run_threaded_report_task)
+        schedule.every().thursday.at(send_time).do(self._run_threaded_report_task)
+        schedule.every().friday.at(send_time).do(self._run_threaded_report_task)
+        self._check_schedule() # Inicia a verificação
+
+    def periodic_update(self):
+        """Verifica atualizações na planilha e atualiza a UI."""
+        if self.data_handler.update_flag:
+            if self.data_handler.load_and_process_data():
+                print("Dados atualizados. Atualizando UI.")
+                if self.current_screen:
+                     # Passa o argumento 'single_coord' se a tela atual for a de coordenadores no modo apresentação
+                     current_coord = None
+                     if isinstance(self.current_screen, CoordinatorScreen) and self.is_presentation_mode:
+                          if self.current_coordinator_list and self.coordinator_slideshow_index > 0:
+                               current_coord = self.current_coordinator_list[self.coordinator_slideshow_index - 1] # Pega o que acabou de ser exibido
+                     self.current_screen.update_content(single_coord=current_coord)
+
+        self.root.after(CONFIG["update_interval_ms"], self.periodic_update)
+
+    def run(self):
+        """Inicia o loop principal da aplicação Tkinter."""
+        try:
+            self.root.mainloop()
+        finally:
+            # Garante que o watcher seja parado ao fechar
+            self.file_watcher.stop()
+            self.file_watcher.join()
+            print("Monitoramento de arquivo finalizado.")
+            # Cancela agendamentos pendentes
+            schedule.clear()
+            
+    def periodic_update(self):
+        if self.data_handler.update_flag:
+            if self.data_handler.load_and_process_data():
+                print("Dados atualizados. Atualizando UI.")
+                if self.current_screen: self.current_screen.update_content()
+        self.root.after(CONFIG["update_interval_ms"], self.periodic_update)
+    
+    def run(self):
+        try:
+            self.root.mainloop()
+        finally:
+            self.file_watcher.stop()
+            self.file_watcher.join()
+
+# =============================================================================
+# 5. PONTO DE ENTRADA DO PROGRAMA
+# =============================================================================
+if __name__ == "__main__":
+    # Cria a pasta de screenshots temporários se não existir
+    screenshots_dir = CONFIG["file_paths"]["screenshots_folder"]
+    if not os.path.exists(screenshots_dir):
+        os.makedirs(screenshots_dir)
+        
+    root = tk.Tk()
+    app = DashboardApp(root)
+    app.run()
+
+# =============================================================================
+# Fim ? Não há mais nada além disso. mas quem sabe no futuro... 
+# Projeto: Dashboard de Performance RODOLUB v2.0 Animated
+# Horas Gastas nesse código: 18 horas
+# Autor: Theflerres - Github.com/theflerres 
+# Nome dentro da empresa Rodolub: João Victor Galvão Alves.
+# Data de inicio do projeto: 16 de Outubro de 2024 
+# 1k de linhas de código...(pausa pro cafézinho)
+# =============================================================================
+
